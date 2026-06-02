@@ -1,0 +1,8 @@
+prefix=/home/qwer/drone_ws/devel
+
+Name: drone_practice
+Description: Description of drone_practice
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

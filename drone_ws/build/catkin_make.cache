@@ -1,0 +1,2 @@
+drone_practice
+-DCATKIN_DEVEL_PREFIX=/home/qwer/drone_ws/devel -DCMAKE_INSTALL_PREFIX=/home/qwer/drone_ws/install -G Unix Makefiles

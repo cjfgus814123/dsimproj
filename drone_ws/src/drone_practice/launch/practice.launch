@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<launch>
+
+  <arg name="x" default="0"/>
+  <arg name="y" default="0"/>
+  <arg name="z" default="0.1"/>
+  <arg name="R" default="0"/>
+  <arg name="P" default="0"/>
+  <arg name="Y" default="0"/>
+  <arg name="vehicle" default="iris"/>
+  <arg name="world" default="$(find drone_practice)/worlds/practice.world"/>
+  <arg name="csv_file" default="$(find drone_practice)/mission/practice_path.csv"/>
+  <arg name="sdf" default="$(find drone_practice)/models/iris_with_sensors/iris_rplidar.sdf"/>
+
+  <env name="GAZEBO_MODEL_PATH" value="$(find drone_practice)/models:$(find px4)/Tools/simulation/gazebo-classic/sitl_gazebo-classic/models:$(optenv GAZEBO_MODEL_PATH)"/>
+
+  <include file="/root/PX4-Autopilot/launch/mavros_posix_sitl.launch">
+    <arg name="x"       value="$(arg x)"/>
+    <arg name="y"       value="$(arg y)"/>
+    <arg name="z"       value="$(arg z)"/>
+    <arg name="R"       value="$(arg R)"/>
+    <arg name="P"       value="$(arg P)"/>
+    <arg name="Y"       value="$(arg Y)"/>
+    <arg name="vehicle" value="$(arg vehicle)"/>
+    <arg name="world"   value="$(arg world)"/>
+    <arg name="sdf"     value="$(arg sdf)"/>
+  </include>
+  
+  <node pkg="drone_practice" type="mission_controller.py" name="mission_controller" output="screen" />
+  
+  <node pkg="drone_practice" type="path_follower.py" name="path_follower" output="screen">
+      <param name="csv_path" value="$(arg csv_file)" />
+  </node>
+  
+  <node pkg="drone_practice" type="precision_lander.py" name="precision_lander" output="screen" />
+</launch>
