@@ -5,12 +5,12 @@ import rospy
 import cv2
 import cv2.aruco as aruco
 import numpy as np
+import math
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist, PoseStamped
 from mavros_msgs.srv import SetMode, SetModeRequest
 from std_msgs.msg import Bool
-# [수정됨] 에러를 유발하는 Range 임포트 삭제
 
 class PrecisionLander:
     def __init__(self):
@@ -20,40 +20,71 @@ class PrecisionLander:
         self.current_pose = PoseStamped()
         self.landing_started = False
         self.is_landed = False
-        # ---------------------------------------------------------
-        # [수정] fpv_cam.sdf 파일에 적힌 진짜 스펙으로 완벽 동기화!
-        # ---------------------------------------------------------
+        
+        # 기체 자세 각도 (IMU)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+        
+        # 카메라 렌즈 스펙
         self.focal_length_x = 277.19 
         self.focal_length_y = 277.19 
-
-        # 카메라 해상도 중심점 (320x240의 절반)
         self.image_center_x = 160 
         self.image_center_y = 120 
-        # ---------------------------------------------------------
 
-        # 비전 제어(P-Controller) 파라미터
-        self.kp_metric = 0.05  # P (비례: 현재 오차 대응)
-        self.ki_metric = 0.01 # I (적분: 바람 등 누적 오차 대응)
-        self.kd_metric = 0.1  # D (미분: 급브레이크, 진동 방지)
+        # PID 게인
+        self.kp_metric = 0.15  
+        self.ki_metric = 0.1 
+        self.kd_metric = 0.2  
 
-        # 과거 데이터를 저장할 변수들
         self.error_sum_x = 0.0
         self.error_sum_y = 0.0
         self.prev_error_x = 0.0
         self.prev_error_y = 0.0
-      
-        self.descend_speed = -0.2 # 하강 속도 (m/s)
-        self.land_alt = 0.3       # 착륙 트리거 고도
+        
+        self.descend_speed = -0.2 
+        self.land_alt = 0.3       
+
+        # ==========================================
+        # [핵심] OpenCV Kalman Filter 초기화 (픽셀 필터링용)
+        # 상태 벡터 X = [x, y, v_x, v_y] (4차원)
+        # 측정 벡터 Z = [cx, cy] (2차원)
+        # ==========================================
+        self.kf = cv2.KalmanFilter(4, 2)
+        
+        # 관측 행렬 (H): 측정값 Z가 상태 X의 어떤 부분인지 정의 [x, y 부분만 추출]
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], np.float32)
+        
+        # 상태 전이 행렬 (A): 예측 모델 (등속도 모델, dt는 매 프레임 업데이트됨)
+        # 초기에는 dt = 0.033 (약 30Hz)으로 세팅
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0.033, 0],
+            [0, 1, 0, 0.033],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], np.float32)
+        
+        # 예측 노이즈 (Q): 물리 모델 불확실성 (값이 클수록 예측보다 센서를 믿음)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        
+        # 측정 노이즈 (R): 카메라/YOLO 흔들림 (값이 클수록 센서를 덜 믿고 부드러워짐)
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+        
+        # 오차 공분산 초기화 (P)
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
+        
+        self.last_time = rospy.Time.now()
+        self.kf_initialized = False # 칼만 필터가 첫 프레임을 받았는지 확인
 
         self.debug_pub = rospy.Publisher("/camera/image_debug", Image, queue_size=1)
 
-        # ROS Subscribers
         rospy.Subscriber("mavros/local_position/pose", PoseStamped, self.pose_cb)
         rospy.Subscriber("/iris/usb_cam/image_raw", Image, self.image_cb)
         rospy.Subscriber("/mission/start_landing", Bool, self.start_landing_cb)
-        # [수정됨] 에러를 유발하는 2D 라이다(/laser/scan) 구독 삭제
 
-        # ROS Publishers & Services
         self.vel_pub = rospy.Publisher("mavros/setpoint_velocity/cmd_vel_unstamped", Twist, queue_size=10)
         rospy.wait_for_service("/mavros/set_mode")
         self.set_mode_client = rospy.ServiceProxy("/mavros/set_mode", SetMode)
@@ -62,27 +93,46 @@ class PrecisionLander:
 
     def pose_cb(self, msg):
         self.current_pose = msg
+        q = msg.pose.orientation
+        
+        sinr_cosp = 2 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1 - 2 * (q.x**2 + q.y**2)
+        self.roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2 * (q.w * q.y - q.z * q.x)
+        if abs(sinp) >= 1:
+            self.pitch = math.copysign(math.pi / 2, sinp)
+        else:
+            self.pitch = math.asin(sinp)
+
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y**2 + q.z**2)
+        self.yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def start_landing_cb(self, msg):
         self.landing_started = msg.data
 
     def image_cb(self, msg):
         if not self.landing_started or self.is_landed:
+            self.last_time = rospy.Time.now()
             return
 
         try:
+            current_time = rospy.Time.now()
+            dt = (current_time - self.last_time).to_sec()
+            if dt <= 0: dt = 0.033
+            self.last_time = current_time
+
+            # 칼만 필터의 A(상태전이행렬)에 현재 dt 반영
+            self.kf.transitionMatrix[0, 2] = dt
+            self.kf.transitionMatrix[1, 3] = dt
+
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            
             height, width, _ = cv_image.shape
             self.image_center_x = width // 2
             self.image_center_y = height // 2
 
-            # ==========================================
-            # [핵심 수정] ArUco 대신 HSV 색상 공간에서 빨간색 영역 찾기
-            # ==========================================
             hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-            
-            # 빨간색은 HSV 스펙트럼의 양끝(0 근처, 180 근처)에 걸쳐 있으므로 두 영역을 합쳐야 합니다.
             lower_red1 = np.array([0, 100, 100])
             upper_red1 = np.array([10, 255, 255])
             lower_red2 = np.array([160, 100, 100])
@@ -90,96 +140,125 @@ class PrecisionLander:
 
             mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
             mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-            mask = cv2.bitwise_or(mask1, mask2) # 빨간색만 흰색으로 보이는 흑백 마스크 생성
+            mask = cv2.bitwise_or(mask1, mask2)
 
-            # 흰색(빨간색) 덩어리들의 윤곽선(Contours) 찾기
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             target_found = False
-            marker_center_x, marker_center_y = 0, 0
+            raw_cx, raw_cy = 0, 0
 
             if len(contours) > 0:
-                # 화면에 빨간색이 여러 개일 수 있으니 가장 '큰' 덩어리를 찾습니다.
                 largest_contour = max(contours, key=cv2.contourArea)
-                
-                # 아주 작은 노이즈(먼지)가 잡히는 것을 방지하기 위해 픽셀 면적이 100 이상일 때만 패드로 인정
                 if cv2.contourArea(largest_contour) > 100:
                     M = cv2.moments(largest_contour)
                     if M["m00"] != 0:
-                        marker_center_x = int(M["m10"] / M["m00"])
-                        marker_center_y = int(M["m01"] / M["m00"])
+                        raw_cx = int(M["m10"] / M["m00"])
+                        raw_cy = int(M["m01"] / M["m00"])
                         target_found = True
-                        
-                        # (선택) 인식된 빨간 패드의 외곽선에 노란색 선 그리기
                         cv2.drawContours(cv_image, [largest_contour], -1, (0, 255, 255), 2)
 
             cmd_vel = Twist()
             current_z = max(0.1, self.current_pose.pose.position.z)
             
-            # (이전의 'if ids is not None:' 을 'if target_found:' 로 바꿉니다)
+            # ==========================================
+            # OpenCV Kalman Filter: 예측 및 업데이트 (픽셀 기준)
+            # ==========================================
+            # 항상 미래 위치를 먼저 예측 (Prediction)
+            predicted = self.kf.predict()
+            kf_cx, kf_cy = predicted[0][0], predicted[1][0]
+
             if target_found:
-                # 1. 픽셀 오차 계산
-                error_x_pixel = marker_center_x - self.image_center_x
-                error_y_pixel = marker_center_y - self.image_center_y
+                # 첫 발견 시, 필터가 엉뚱한 곳에서 시작하지 않도록 위치 강제 초기화
+                if not self.kf_initialized:
+                    self.kf.statePost = np.array([[raw_cx], [raw_cy], [0], [0]], np.float32)
+                    kf_cx, kf_cy = raw_cx, raw_cy
+                    self.kf_initialized = True
+                else:
+                    # 측정이 들어오면 Z 행렬을 만들어 Update
+                    measurement = np.array([[np.float32(raw_cx)], [np.float32(raw_cy)]])
+                    estimated = self.kf.correct(measurement)
+                    kf_cx, kf_cy = estimated[0][0], estimated[1][0]
+            else:
+                # 타겟을 놓친 경우, update 없이 predict된 값(관성)을 그대로 믿음
+                pass
 
-               # 2. 핀홀 카메라 모델 적용 (현재 오차 P)
-                error_x_meter = (error_x_pixel * current_z) / self.focal_length_x
-                error_y_meter = (error_y_pixel * current_z) / self.focal_length_y
+            # ==========================================
+            # 보정된 픽셀 좌표(kf_cx, kf_cy)로 물리 오차 제어
+            # ==========================================
+            if self.kf_initialized:
+                error_x_pixel = kf_cx - self.image_center_x
+                error_y_pixel = kf_cy - self.image_center_y
 
-                # (추가) I 제어: 오차 누적 (바람 저항력)
-                self.error_sum_x += error_x_meter
-                self.error_sum_y += error_y_meter
+                # 핀홀 모델 (보정된 픽셀 -> 물리적 미터)
+                raw_x_meter = (error_x_pixel * current_z) / self.focal_length_x
+                raw_y_meter = (error_y_pixel * current_z) / self.focal_length_y
 
-                # (추가) D 제어: 오차 변화량 (브레이크 역할)
-                diff_error_x = error_x_meter - self.prev_error_x
-                diff_error_y = error_y_meter - self.prev_error_y
+                # IMU 자세 보상 (가짜 오차 제거)
+                comp_x = current_z * math.tan(self.pitch)
+                comp_y = current_z * math.tan(self.roll)
 
-                # 4. 풀 PID 계산 후 속도 명령에 대입
-                pid_x = (self.kp_metric * error_x_meter) + (self.ki_metric * self.error_sum_x) + (self.kd_metric * diff_error_x)
-                pid_y = (self.kp_metric * error_y_meter) + (self.ki_metric * self.error_sum_y) + (self.kd_metric * diff_error_y)
+                true_x_meter = raw_x_meter - comp_x
+                true_y_meter = raw_y_meter - comp_y
 
-                # 카메라 좌표계와 드론 좌표계 축 변환 적용 (x오차는 y속도로, y오차는 x속도로)
-                cmd_vel.linear.x = -pid_y
-                cmd_vel.linear.y = pid_x
+                # PID 제어부
+                self.error_sum_x = np.clip(self.error_sum_x + true_x_meter, -1.0, 1.0)
+                self.error_sum_y = np.clip(self.error_sum_y + true_y_meter, -1.0, 1.0)
 
-                # 다음 루프를 위해 현재 오차를 과거 오차로 저장
-                self.prev_error_x = error_x_meter
-                self.prev_error_y = error_y_meter
+                if abs(error_x_pixel) < 10 and abs(error_y_pixel) < 10:
+                    self.error_sum_x = 0.0
+                    self.error_sum_y = 0.0
 
-                # 화면 중앙(오차 50픽셀 이내)에 들어오면 하강, 아니면 제자리에서 위치만 맞춤
-                if abs(error_x_pixel) < 50 and abs(error_y_pixel) < 50:
+                diff_error_x = true_x_meter - self.prev_error_x
+                diff_error_y = true_y_meter - self.prev_error_y
+
+                pid_x = (self.kp_metric * true_x_meter) + (self.ki_metric * self.error_sum_x) + (self.kd_metric * diff_error_x)
+                pid_y = (self.kp_metric * true_y_meter) + (self.ki_metric * self.error_sum_y) + (self.kd_metric * diff_error_y)
+
+                # 90도 회전 카메라 매핑
+                cmd_vel.linear.x = float(np.clip(pid_x, -1.0, 1.0))
+                cmd_vel.linear.y = float(np.clip(-pid_y, -1.0, 1.0))
+
+                self.prev_error_x = true_x_meter
+                self.prev_error_y = true_y_meter
+
+                # 하강 판정
+                if abs(error_x_pixel) < 80 and abs(error_y_pixel) < 80:
                     cmd_vel.linear.z = self.descend_speed
                 else:
-                    cmd_vel.linear.z = 0.0
-
-                rospy.loginfo_throttle(0.5, f"Err(X,Y): ({error_x_pixel:3d}, {error_y_pixel:3d}) | Vel(X,Y): ({cmd_vel.linear.x:5.2f}, {cmd_vel.linear.y:5.2f}) | Alt: {current_z:.2f}m")
-
-                # (기존 코드) 중앙 십자선과 빨간 점, 오차 선 그리기
-                cv2.drawMarker(cv_image, (self.image_center_x, self.image_center_y), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
-                cv2.circle(cv_image, (marker_center_x, marker_center_y), 5, (0, 0, 255), -1)
-                cv2.line(cv_image, (self.image_center_x, self.image_center_y), (marker_center_x, marker_center_y), (255, 0, 0), 2)
-                
-                # ==========================================
-                # [추가] 화면 좌측 상단에 실시간 계산 데이터(HUD) 텍스트 출력
-                # ==========================================
-                cv2.putText(cv_image, f"1. Alt(Z)   : {current_z:.2f} m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                cv2.putText(cv_image, f"2. Pix Err  : ({error_x_pixel}, {error_y_pixel}) px", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
-                # 핀홀 모델로 계산된 실제 물리적 오차 (초록색)
-                cv2.putText(cv_image, f"3. Meter Err: ({error_x_meter:.2f}, {error_y_meter:.2f}) m", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # P 제어로 계산된 최종 명령 속도 (빨간색)
-                cv2.putText(cv_image, f"4. Cmd Vel  : ({cmd_vel.linear.x:.2f}, {cmd_vel.linear.y:.2f}) m/s", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                # ==========================================
-
-                if current_z < self.land_alt:
-                    self.trigger_auto_land()
+                    cmd_vel.linear.z = -0.05 
+                    
+                rospy.loginfo_throttle(0.5, f"Raw Pix:({raw_cx},{raw_cy}) | KF Pix:({int(kf_cx)},{int(kf_cy)}) | Vel:({cmd_vel.linear.x:.2f},{cmd_vel.linear.y:.2f})")
 
             else:
-                cv2.putText(cv_image, "RED PAD LOST - HOVERING", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cmd_vel.linear.x = 0.0
                 cmd_vel.linear.y = 0.0
-                cmd_vel.linear.z = 0.0
+                cmd_vel.linear.z = -0.05 
+                self.error_sum_x, self.error_sum_y = 0.0, 0.0
+                self.prev_error_x, self.error_y_meter = 0.0, 0.0
+
+            # HUD 드로잉: 원본 YOLO(빨강) vs KF 추정치(초록) 비교
+            cv2.drawMarker(cv_image, (self.image_center_x, self.image_center_y), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+            if target_found:
+                cv2.circle(cv_image, (raw_cx, raw_cy), 5, (0, 0, 255), -1) # Raw: 빨간 점
+            if self.kf_initialized:
+                cv2.circle(cv_image, (int(kf_cx), int(kf_cy)), 8, (0, 255, 0), 2) # KF: 초록색 큰 원
+                cv2.line(cv_image, (self.image_center_x, self.image_center_y), (int(kf_cx), int(kf_cy)), (255, 0, 0), 2)
+
+            cv2.putText(cv_image, f"1. Alt(Z)   : {current_z:.2f} m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(cv_image, f"2. KF Pixel : ({int(kf_cx)}, {int(kf_cy)})", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(cv_image, f"3. Cmd Vel  : ({cmd_vel.linear.x:.2f}, {cmd_vel.linear.y:.2f}) m/s", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            if not target_found and self.kf_initialized:
+                cv2.putText(cv_image, "PAD LOST - KF TRACKING...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+
+            if current_z < self.land_alt:
+                # 완벽하게 중심(오차 15픽셀 이내)에 들어왔는지 확인
+                if abs(error_x_pixel) < 15 and abs(error_y_pixel) < 15:
+                    self.trigger_auto_land()
+                else:
+                    # 아직 중심에 못 왔다면, 더 이상 하강하지 말고 그 고도에서 호버링하며 중심을 맞춤!
+                    cmd_vel.linear.z = 0.0 
+                    cv2.putText(cv_image, "ALIGNING FOR LAND...", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
             debug_msg = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
             self.debug_pub.publish(debug_msg)

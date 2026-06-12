@@ -5,10 +5,10 @@ import rospy
 import csv
 import math
 import os
-import numpy as np  # [추가] 속도 제한(clip) 연산을 위해 추가
+import numpy as np  
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import Bool
-from sensor_msgs.msg import LaserScan  # [추가] 라이다 데이터를 받기 위해 추가
+from sensor_msgs.msg import LaserScan  
 
 class PathFollower:
     def __init__(self):
@@ -18,26 +18,26 @@ class PathFollower:
         self.mission_started = False
         self.is_landing = False
         
-        # Pure Pursuit 파라미터 (목적지 추종)
-        self.lookahead_distance = 1.0  # 타겟을 바라보는 전방 거리 (m)
-        self.max_speed = 1.5           # 드론 최고 비행 속도 (m/s)
-        self.target_alt = 2.5          # 비행 고도 (m)
+        self.current_yaw = 0.0         
+        
+        # 비행 파라미터 
+        self.lookahead_distance = 1.0  
+        self.max_speed = 1.5           
+        self.target_alt = 2.5          
         self.waypoints = []
         self.current_wp_index = 0
         
-        # ==========================================
-        # [추가] 장애물 회피 (APF) 파라미터
-        # ==========================================
-        self.avoid_vel_x = 0.0
-        self.avoid_vel_y = 0.0
-        self.safe_distance = 3.0       # 장애물 회피를 시작할 위험 반경 (m)
-        self.repulsive_gain = 1.5      # 장애물이 드론을 밀어내는 힘의 세기 (튜닝 필요)
-
+        # [핵심 추가] 드론 뒤집힘 방지를 위한 속도 필터 변수
+        self.filtered_vx = 0.0
+        self.filtered_vy = 0.0
+        
+        # 로컬 기준 회피 속도 변수
+        self.avoid_local_x = 0.0
+        self.avoid_local_y = 0.0
+        
         # ROS Subscribers
         rospy.Subscriber("mavros/local_position/pose", PoseStamped, self.pose_cb)
         rospy.Subscriber("/mission/start_flag", Bool, self.start_cb)
-        
-        # [추가] 라이다 센서 토픽 구독 (시뮬레이터 환경에 맞춰 토픽명 수정 필요할 수 있음)
         rospy.Subscriber("/laser/scan", LaserScan, self.lidar_cb)
 
         # ROS Publishers
@@ -49,36 +49,45 @@ class PathFollower:
 
     def pose_cb(self, msg):
         self.current_pose = msg
+        q = msg.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y**2 + q.z**2)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def start_cb(self, msg):
         self.mission_started = msg.data
 
     # ==========================================
-    # [추가] 라이다 콜백 함수 (장애물 회피 속도 계산)
+    # [로컬 APF] 드론 기체 기준(Local)으로 장애물 밀어내기
     # ==========================================
     def lidar_cb(self, msg):
         force_x = 0.0
         force_y = 0.0
+        
+        safe_distance = 3.0   
+        repulsive_gain = 1.0  # 뒤집힘 방지를 위해 밀어내는 힘을 약간 줄임
 
         for i, distance in enumerate(msg.ranges):
-            # 너무 가깝거나(기체 노이즈) 측정 불가(무한대) 값 무시
-            if distance < msg.range_min or distance > msg.range_max or math.isinf(distance) or math.isnan(distance):
+            # 노이즈 및 기체 자신 무시
+            if distance < 0.3 or distance > msg.range_max or math.isinf(distance) or math.isnan(distance):
                 continue
             
-            # 장애물이 안전 거리 안으로 들어왔을 때만 회피력 생성
-            if distance < self.safe_distance:
+            if distance < safe_distance:
+                # 라이다 각도는 이미 기체 정면 기준(Local)입니다.
                 angle = msg.angle_min + i * msg.angle_increment
                 
-                # 거리가 가까워질수록 밀어내는 힘이 기하급수적으로 커지는 공식
-                repulsive_force = self.repulsive_gain * (1.0 / distance - 1.0 / self.safe_distance) * (1.0 / (distance**2))
+                # 가까울수록 강하게 밀어내는 힘 계산
+                force = repulsive_gain * (1.0 / distance - 1.0 / safe_distance) * (1.0 / distance**2)
+                force = min(force, 2.0) # 너무 튕기지 않게 제한
                 
-                # 장애물과 반대 방향(-cos, -sin)으로 힘을 누적하여 저장
-                force_x -= repulsive_force * math.cos(angle)
-                force_y -= repulsive_force * math.sin(angle)
+                # 드론 기준(Local)으로 장애물 반대 방향으로 힘 누적
+                force_x -= force * math.cos(angle)
+                force_y -= force * math.sin(angle)
 
-        self.avoid_vel_x = force_x
-        self.avoid_vel_y = force_y
-
+        # 안전을 위해 회피 속도 제한
+        self.avoid_local_x = float(np.clip(force_x, -1.0, 1.0))
+        self.avoid_local_y = float(np.clip(force_y, -1.0, 1.0))
+                        
     def load_waypoints(self):
         csv_path = os.path.expanduser("~/catkin_ws/src/drone_ws/drone_ws/src/drone_practice/mission/practice_path.csv")
         try:
@@ -96,9 +105,6 @@ class PathFollower:
                         except ValueError:
                             continue
             rospy.loginfo(f"Successfully loaded {len(self.waypoints)} waypoints.")
-            if len(self.waypoints) > 0:
-                rospy.loginfo(f" -> 시작점: {self.waypoints[0]}")
-                rospy.loginfo(f" -> 착륙점: {self.waypoints[-1]}")
         except Exception as e:
             rospy.logerr(f"Failed to load CSV file: {e}")
 
@@ -115,10 +121,8 @@ class PathFollower:
             cy = self.current_pose.pose.position.y
             cz = self.current_pose.pose.position.z
             
+            # 1. 목적지 도착 확인
             final_x, final_y = self.waypoints[-1]
-            dist_to_final = self.calc_distance(cx, cy, final_x, final_y)
-
-            # 목적지 도착 확인
             if self.current_wp_index >= len(self.waypoints):
                 if not self.is_landing:
                     rospy.loginfo("Path following complete! Starting Precision Landing.")
@@ -127,13 +131,11 @@ class PathFollower:
                     self.start_landing_pub.publish(land_msg)
                     self.is_landing = True
                 
-                # 착륙 신호를 보낸 후, 제어권을 정밀 착륙 노드에 넘기기 위해 속도를 0으로 유지
-                cmd_vel = Twist()
-                self.vel_pub.publish(cmd_vel)
-                self.rate.sleep()
-                continue
+                rospy.loginfo("Handing over control... Shutting down Path Follower.")
+                rospy.signal_shutdown("Path Following Finished")
+                break 
 
-            # Pure Pursuit 알고리즘
+            # 2. 다음 웨이포인트(타겟) 선정
             target_x, target_y = self.waypoints[self.current_wp_index]
             dist_to_target = self.calc_distance(cx, cy, target_x, target_y)
 
@@ -142,27 +144,50 @@ class PathFollower:
                 if self.current_wp_index < len(self.waypoints):
                     target_x, target_y = self.waypoints[self.current_wp_index]
 
-            dx = target_x - cx
-            dy = target_y - cy
-            dist = math.sqrt(dx**2 + dy**2)
+            # 3. 타겟을 향한 Global 방향 벡터 계산
+            dx_global = target_x - cx
+            dy_global = target_y - cy
+            dist = math.sqrt(dx_global**2 + dy_global**2)
 
             cmd_vel = Twist()
             if dist > 0:
-                # 1. 목적지로 가려는 매력적인(Attractive) 속도 계산
-                target_vel_x = (dx / dist) * self.max_speed
-                target_vel_y = (dy / dist) * self.max_speed
+                # ==========================================
+                # [해결 1] Global 타겟 벡터를 드론의 Local 벡터로 회전 변환
+                # ==========================================
+                dx_local = dx_global * math.cos(self.current_yaw) + dy_global * math.sin(self.current_yaw)
+                dy_local = -dx_global * math.sin(self.current_yaw) + dy_global * math.cos(self.current_yaw)
+
+                target_vel_local_x = (dx_local / dist) * self.max_speed
+                target_vel_local_y = (dy_local / dist) * self.max_speed
 
                 # ==========================================
-                # [핵심 수정] 목적지 속도 + 장애물 회피 속도 결합
+                # [해결 2] 타겟(Local) + 회피(Local)
                 # ==========================================
-                final_vel_x = target_vel_x + self.avoid_vel_x
-                final_vel_y = target_vel_y + self.avoid_vel_y
+                raw_vx = target_vel_local_x + self.avoid_local_x
+                raw_vy = target_vel_local_y + self.avoid_local_y
 
-                # 안전을 위해 속도가 max_speed를 넘지 않도록 제한(Clipping)
-                cmd_vel.linear.x = float(np.clip(final_vel_x, -self.max_speed, self.max_speed))
-                cmd_vel.linear.y = float(np.clip(final_vel_y, -self.max_speed, self.max_speed))
+                # ==========================================
+                # [해결 3] 뒤집힘 방지 스무딩 (Low-Pass Filter)
+                # 속도가 급변하지 않고 자동차 엑셀처럼 부드럽게 올라가고 내려갑니다.
+                # ==========================================
+                alpha = 0.2  # 0.0 ~ 1.0 사이 (작을수록 훨씬 부드럽지만 반응이 살짝 느림)
+                self.filtered_vx = (alpha * raw_vx) + ((1.0 - alpha) * self.filtered_vx)
+                self.filtered_vy = (alpha * raw_vy) + ((1.0 - alpha) * self.filtered_vy)
+
+                cmd_vel.linear.x = float(np.clip(self.filtered_vx, -self.max_speed, self.max_speed))
+                cmd_vel.linear.y = float(np.clip(self.filtered_vy, -self.max_speed, self.max_speed))
+                
+                # ---------------------------------------------------------
+                # [헤딩 제어] 드론의 코가 목적지를 바라보도록 부드럽게 회전
+                # ---------------------------------------------------------
+                target_yaw = math.atan2(dy_global, dx_global)
+                yaw_error = target_yaw - self.current_yaw
+                yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi
+                
+                # 기수 회전 시 너무 휙 돌지 않게 속도 감소 (0.5)
+                cmd_vel.angular.z = float(np.clip(yaw_error * 1.0, -0.5, 0.5))
             
-            # 고도 유지 제어
+            # 4. 고도 유지 제어
             alt_error = self.target_alt - cz
             cmd_vel.linear.z = alt_error * 1.0
 
