@@ -33,4 +33,5 @@
   </node>
   
   <node pkg="drone_practice" type="precision_lander.py" name="precision_lander" output="screen" />
+  <node pkg="rviz" type="rviz" name="rviz" args="-d $(find drone_practice)/rviz/landing.rviz" />
 </launch>
