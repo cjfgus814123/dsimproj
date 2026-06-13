@@ -8,8 +8,8 @@
   <arg name="P" default="0"/>
   <arg name="Y" default="0"/>
   <arg name="vehicle" default="iris"/>
-  <arg name="world" default="$(find drone_practice)/worlds/practice.world"/>
-  <arg name="csv_file" default="$(find drone_practice)/mission/practice_path.csv"/>
+  <arg name="world" default="$(find drone_practice)/worlds/hard_test.world"/>
+  <arg name="csv_file" default="$(find drone_practice)/mission/hard_test.csv"/>
   <arg name="sdf" default="$(find drone_practice)/models/iris_with_sensors/iris_rplidar.sdf"/>
 
   <env name="GAZEBO_MODEL_PATH" value="$(find drone_practice)/models:$(find px4)/Tools/simulation/gazebo-classic/sitl_gazebo-classic/models:$(optenv GAZEBO_MODEL_PATH)"/>
