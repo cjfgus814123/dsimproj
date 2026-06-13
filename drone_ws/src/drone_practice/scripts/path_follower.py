@@ -20,20 +20,26 @@ class PathFollower:
         
         self.current_yaw = 0.0         
         
-        # 비행 파라미터 
-        self.lookahead_distance = 1.0  
-        self.max_speed = 1.5           
+        # 비행 및 목표 파라미터
+        self.max_speed = 2.0           
         self.target_alt = 2.5          
+        self.arrive_dist = 1.5        # 마지막 도착 판단 거리
         self.waypoints = []
-        self.current_wp_index = 0
         
-        # [핵심 추가] 드론 뒤집힘 방지를 위한 속도 필터 변수
+        # ==========================================
+        # [통합 1] Stanley 제어기 파라미터
+        # ==========================================
+        self.stanley_k = 1.0          # 선으로 복귀하려는 힘(Gain)
+        self.closest_idx = 0          # 현재 가장 가까운 경로점 인덱스
+        
+        # 뒤집힘 방지를 위한 속도 필터 변수 (LPF)
         self.filtered_vx = 0.0
         self.filtered_vy = 0.0
         
-        # 로컬 기준 회피 속도 변수
-        self.avoid_local_x = 0.0
-        self.avoid_local_y = 0.0
+        # VFH 연산을 위한 라이다 데이터 저장소
+        self.latest_scan = None
+        self.scan_angle_min = 0.0
+        self.scan_angle_inc = 0.0
         
         # ROS Subscribers
         rospy.Subscriber("mavros/local_position/pose", PoseStamped, self.pose_cb)
@@ -57,40 +63,133 @@ class PathFollower:
     def start_cb(self, msg):
         self.mission_started = msg.data
 
-    # ==========================================
-    # [로컬 APF] 드론 기체 기준(Local)으로 장애물 밀어내기
-    # ==========================================
     def lidar_cb(self, msg):
-        force_x = 0.0
-        force_y = 0.0
+        self.latest_scan = msg.ranges
+        self.scan_angle_min = msg.angle_min
+        self.scan_angle_inc = msg.angle_increment
+
+    # ==========================================
+    # [통합 2] Stanley Controller 로직 (목표 방향 지시)
+    # ==========================================
+    def find_closest_idx(self, cx, cy):
+        """현재 위치에서 가장 가까운 경로점 탐색 (앞으로 전진만 하도록)"""
+        min_dist = float('inf')
+        best_idx = self.closest_idx
+
+        search_end = min(len(self.waypoints), self.closest_idx + 50)
+        for i in range(self.closest_idx, search_end):
+            wx, wy = self.waypoints[i]
+            d = self.calc_distance(cx, cy, wx, wy)
+            if d < min_dist:
+                min_dist = d
+                best_idx = i
+        return best_idx
+
+    def get_stanley_target_angle(self, cx, cy):
+        """경로 방향과 횡방향 오차를 합산하여 최적의 비행 각도(Global) 반환"""
+        self.closest_idx = self.find_closest_idx(cx, cy)
+        idx = self.closest_idx
+
+        # 경로 방향(Path angle) 계산
+        if idx + 1 < len(self.waypoints):
+            fx, fy = self.waypoints[idx]
+            nx, ny = self.waypoints[idx + 1]
+            path_angle = math.atan2(ny - fy, nx - fx)
+        else:
+            path_angle = math.atan2(
+                self.waypoints[-1][1] - self.waypoints[-2][1],
+                self.waypoints[-1][0] - self.waypoints[-2][0]
+            )
+
+        # 횡방향 오차(Cross-track error) 계산
+        wx, wy = self.waypoints[idx]
+        lateral_error = ((cx - wx) * math.sin(path_angle) - (cy - wy) * math.cos(path_angle))
+
+        # Stanley 보정각 합산
+        speed = max(self.max_speed, 0.1)
+        correction = math.atan2(self.stanley_k * lateral_error, speed)
+
+        return path_angle + correction
+
+    # ==========================================
+    # [통합 3] Pure VFH 알고리즘 (안전한 회피 방향 및 속도 결정)
+    # ==========================================
+    def compute_vfh_velocity(self, target_angle_local):
+        if self.latest_scan is None:
+            # 라이다 데이터가 없으면 Stanley가 지시한 방향으로 직진
+            return self.max_speed * math.cos(target_angle_local), self.max_speed * math.sin(target_angle_local)
+
+        num_bins = 72  
+        bin_size = 2.0 * math.pi / num_bins
+        histogram = [0.0] * num_bins
         
-        safe_distance = 3.0   
-        repulsive_gain = 1.0  # 뒤집힘 방지를 위해 밀어내는 힘을 약간 줄임
+        safe_dist = 3.0       
+        drone_radius = 0.6    
 
-        for i, distance in enumerate(msg.ranges):
-            # 노이즈 및 기체 자신 무시
-            if distance < 0.3 or distance > msg.range_max or math.isinf(distance) or math.isnan(distance):
-                continue
-            
-            if distance < safe_distance:
-                # 라이다 각도는 이미 기체 정면 기준(Local)입니다.
-                angle = msg.angle_min + i * msg.angle_increment
+        for i, dist in enumerate(self.latest_scan):
+            if 0.3 < dist < safe_dist and not math.isinf(dist) and not math.isnan(dist):
+                angle = self.scan_angle_min + i * self.scan_angle_inc
+                mag = (safe_dist - dist) ** 2  
+                enlargement = math.asin(min(drone_radius / dist, 1.0))
                 
-                # 가까울수록 강하게 밀어내는 힘 계산
-                force = repulsive_gain * (1.0 / distance - 1.0 / safe_distance) * (1.0 / distance**2)
-                force = min(force, 2.0) # 너무 튕기지 않게 제한
+                min_angle = angle - enlargement
+                max_angle = angle + enlargement
                 
-                # 드론 기준(Local)으로 장애물 반대 방향으로 힘 누적
-                force_x -= force * math.cos(angle)
-                force_y -= force * math.sin(angle)
+                min_bin = int(math.floor((min_angle - (-math.pi)) / bin_size)) % num_bins
+                max_bin = int(math.floor((max_angle - (-math.pi)) / bin_size)) % num_bins
+                
+                if min_bin <= max_bin:
+                    for b in range(min_bin, max_bin + 1):
+                        histogram[b] += mag
+                else: 
+                    for b in range(min_bin, num_bins):
+                        histogram[b] += mag
+                    for b in range(0, max_bin + 1):
+                        histogram[b] += mag
 
-        # 안전을 위해 회피 속도 제한
-        self.avoid_local_x = float(np.clip(force_x, -1.0, 1.0))
-        self.avoid_local_y = float(np.clip(force_y, -1.0, 1.0))
-                        
+        smoothed = [0.0] * num_bins
+        for i in range(num_bins):
+            val = sum(histogram[(i + j) % num_bins] for j in range(-2, 3))
+            smoothed[i] = val / 5.0
+
+        threshold = 1.0  
+        open_bins = [i for i in range(num_bins) if smoothed[i] < threshold]
+
+        if not open_bins:
+            # 완벽히 갇혔을 때: 제자리 멈춤
+            return 0.0, 0.0
+
+        target_bin = int(math.floor((target_angle_local - (-math.pi)) / bin_size)) % num_bins
+        best_bin = open_bins[0]
+        min_cost = float('inf')
+        
+        for b in open_bins:
+            diff = abs(b - target_bin)
+            if diff > num_bins / 2:
+                diff = num_bins - diff  
+                
+            if diff < min_cost:
+                min_cost = diff
+                best_bin = b
+
+        chosen_angle_local = -math.pi + best_bin * bin_size + (bin_size / 2.0)
+        
+        deviation = min_cost * bin_size
+        speed_factor = max(0.4, math.cos(deviation)) 
+        
+        v_x = self.max_speed * speed_factor * math.cos(chosen_angle_local)
+        v_y = self.max_speed * speed_factor * math.sin(chosen_angle_local)
+        
+        return v_x, v_y
+
     def load_waypoints(self):
-        csv_path = os.path.expanduser("~/catkin_ws/src/drone_ws/drone_ws/src/drone_practice/mission/practice_path.csv")
+        import rospkg
         try:
+            rospack = rospkg.RosPack()
+            pkg_path = rospack.get_path('drone_practice')
+            default_path = os.path.join(pkg_path, 'mission', 'practice_path.csv')
+            csv_path = rospy.get_param("~csv_path", default_path)
+            
             with open(csv_path, 'r') as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
@@ -121,9 +220,11 @@ class PathFollower:
             cy = self.current_pose.pose.position.y
             cz = self.current_pose.pose.position.z
             
-            # 1. 목적지 도착 확인
+            # 1. 최종 목적지 도착 확인
             final_x, final_y = self.waypoints[-1]
-            if self.current_wp_index >= len(self.waypoints):
+            dist_to_final = self.calc_distance(cx, cy, final_x, final_y)
+            
+            if dist_to_final < self.arrive_dist:
                 if not self.is_landing:
                     rospy.loginfo("Path following complete! Starting Precision Landing.")
                     land_msg = Bool()
@@ -135,61 +236,34 @@ class PathFollower:
                 rospy.signal_shutdown("Path Following Finished")
                 break 
 
-            # 2. 다음 웨이포인트(타겟) 선정
-            target_x, target_y = self.waypoints[self.current_wp_index]
-            dist_to_target = self.calc_distance(cx, cy, target_x, target_y)
+            # ==========================================
+            # [통합 4] 제어 파이프라인 (Stanley -> VFH -> CMD_VEL)
+            # ==========================================
+            # A. Stanley 제어기로 "이상적인 Global 방향" 계산
+            target_angle_global = self.get_stanley_target_angle(cx, cy)
 
-            if dist_to_target < self.lookahead_distance:
-                self.current_wp_index += 1
-                if self.current_wp_index < len(self.waypoints):
-                    target_x, target_y = self.waypoints[self.current_wp_index]
+            # B. 기체의 현재 헤딩을 고려하여 "Local 타겟 각도"로 변환
+            target_angle_local = target_angle_global - self.current_yaw
+            target_angle_local = (target_angle_local + math.pi) % (2 * math.pi) - math.pi
 
-            # 3. 타겟을 향한 Global 방향 벡터 계산
-            dx_global = target_x - cx
-            dy_global = target_y - cy
-            dist = math.sqrt(dx_global**2 + dy_global**2)
+            # C. VFH에 Local 타겟 각도를 넘겨주어 장애물을 피하는 "실제 비행 속도" 도출
+            raw_vx, raw_vy = self.compute_vfh_velocity(target_angle_local)
+
+            # D. 기체 안정화를 위한 속도 Low-Pass Filter
+            alpha = 0.2  
+            self.filtered_vx = (alpha * raw_vx) + ((1.0 - alpha) * self.filtered_vx)
+            self.filtered_vy = (alpha * raw_vy) + ((1.0 - alpha) * self.filtered_vy)
 
             cmd_vel = Twist()
-            if dist > 0:
-                # ==========================================
-                # [해결 1] Global 타겟 벡터를 드론의 Local 벡터로 회전 변환
-                # ==========================================
-                dx_local = dx_global * math.cos(self.current_yaw) + dy_global * math.sin(self.current_yaw)
-                dy_local = -dx_global * math.sin(self.current_yaw) + dy_global * math.cos(self.current_yaw)
-
-                target_vel_local_x = (dx_local / dist) * self.max_speed
-                target_vel_local_y = (dy_local / dist) * self.max_speed
-
-                # ==========================================
-                # [해결 2] 타겟(Local) + 회피(Local)
-                # ==========================================
-                raw_vx = target_vel_local_x + self.avoid_local_x
-                raw_vy = target_vel_local_y + self.avoid_local_y
-
-                # ==========================================
-                # [해결 3] 뒤집힘 방지 스무딩 (Low-Pass Filter)
-                # 속도가 급변하지 않고 자동차 엑셀처럼 부드럽게 올라가고 내려갑니다.
-                # ==========================================
-                alpha = 0.2  # 0.0 ~ 1.0 사이 (작을수록 훨씬 부드럽지만 반응이 살짝 느림)
-                self.filtered_vx = (alpha * raw_vx) + ((1.0 - alpha) * self.filtered_vx)
-                self.filtered_vy = (alpha * raw_vy) + ((1.0 - alpha) * self.filtered_vy)
-
-                cmd_vel.linear.x = float(np.clip(self.filtered_vx, -self.max_speed, self.max_speed))
-                cmd_vel.linear.y = float(np.clip(self.filtered_vy, -self.max_speed, self.max_speed))
-                
-                # ---------------------------------------------------------
-                # [헤딩 제어] 드론의 코가 목적지를 바라보도록 부드럽게 회전
-                # ---------------------------------------------------------
-                target_yaw = math.atan2(dy_global, dx_global)
-                yaw_error = target_yaw - self.current_yaw
-                yaw_error = (yaw_error + math.pi) % (2 * math.pi) - math.pi
-                
-                # 기수 회전 시 너무 휙 돌지 않게 속도 감소 (0.5)
-                cmd_vel.angular.z = float(np.clip(yaw_error * 1.0, -0.5, 0.5))
+            cmd_vel.linear.x = float(np.clip(self.filtered_vx, -self.max_speed, self.max_speed))
+            cmd_vel.linear.y = float(np.clip(self.filtered_vy, -self.max_speed, self.max_speed))
             
-            # 4. 고도 유지 제어
+            # E. 게걸음 비행 유지 (헤딩 회전 금지)
+            cmd_vel.angular.z = 0.0 
+            
+            # F. 고도 유지 제어
             alt_error = self.target_alt - cz
-            cmd_vel.linear.z = alt_error * 1.0
+            cmd_vel.linear.z = float(np.clip(alt_error * 1.0, -1.0, 1.0))
 
             self.vel_pub.publish(cmd_vel)
             self.rate.sleep()
