@@ -8,19 +8,19 @@ Autonomous UAV Navigation & Precision Landing System
 ---
  1. 하이브리드 장애물 회피 (Hybrid Obstacle Avoidance)
 
-Depth Camera (전역적 판단): 45도 형태의 거대 벽면을 인식하고 '우회 방향 잠금(Hysteresis Lock)'을 수행하여 연산 폭주(Time Jump) 및 갈팡질팡하는 진동 현상을 원천 차단합니다.
-RPLiDAR + VFH (지역적 회피): 72방향으로 압축된 Vector Field Histogram을 통해 좁은 기둥이나 국소적 장애물을 부드럽게 회피합니다.
+ * Depth Camera (전역적 판단): 45도 형태의 거대 벽면을 인식하고 '우회 방향 잠금(Hysteresis Lock)'을 수행하여 연산 폭주(Time Jump) 및 갈팡질팡하는 진동 현상을 원천 차단합니다.
+ * RPLiDAR + VFH (지역적 회피): 72방향으로 압축된 Vector Field Histogram을 통해 좁은 기둥이나 국소적 장애물을 부드럽게 회피합니다.
 
 2. 시각 기반 정밀 착륙 (Vision-based Precision Landing)
 
- OpenCV & Kalman Filter: 하단 카메라를 통해 빨간색 랜딩 패드를 실시간으로 인식하며, 칼만 필터(Kalman Filter)를 통해 센서 노이즈를 제거하고 타겟의 위치를 부드럽게 추적합니다.
- IMU 자세 보상 (Attitude Compensation): 기체의 Roll/Pitch 기울어짐으로 인해 발생하는 카메라 프레임 상의 가짜 오차(Fake Error)를 물리·수학적으로 상쇄하여 정밀도를 극대화합니다.
- 동적 하강 로직 (Dynamic Descent): 십자선 정렬 상태(Pixel Error)에 따라 하강 속도(Hovering -> 미세 하강 -> 정상 하강)를 동적으로 제어하여 패드를 벗어나는 추락을 방지합니다.
+ * OpenCV & Kalman Filter: 하단 카메라를 통해 빨간색 랜딩 패드를 실시간으로 인식하며, 칼만 필터(Kalman Filter)를 통해 센서 노이즈를 제거하고 타겟의 위치를 부드럽게 추적합니다.
+ * IMU 자세 보상 (Attitude Compensation): 기체의 Roll/Pitch 기울어짐으로 인해 발생하는 카메라 프레임 상의 가짜 오차(Fake Error)를 물리·수학적으로 상쇄하여 정밀도를 극대화합니다.
+ * 동적 하강 로직 (Dynamic Descent): 십자선 정렬 상태(Pixel Error)에 따라 하강 속도(Hovering -> 미세 하강 -> 정상 하강)를 동적으로 제어하여 패드를 벗어나는 추락을 방지합니다.
 
 3. EKF2 고도 다중 센서 융합 (Altitude Sensor Fusion)
 
-기압계(Barometer)의 환경적 드리프트를 극복하기 위해 1D LiDAR(Range Sensor) 데이터를 PX4 EKF2 알고리즘에 상시 융합합니다 
-(`EKF2_HGT_REF = 2`, `EKF2_RNG_CTRL = 2`). 이를 통해 고속 강하 시에도 매우 정밀한 AGL(지상고) 추정치를 확보합니다.
+ * 기압계(Barometer)의 환경적 드리프트를 극복하기 위해 1D LiDAR(Range Sensor) 데이터를 PX4 EKF2 알고리즘에 상시 융합합니다 
+   (`EKF2_HGT_REF = 2`, `EKF2_RNG_CTRL = 2`). 이를 통해 고속 강하 시에도 매우 정밀한 AGL(지상고) 추정치를 확보합니다.
 
 ---
 
