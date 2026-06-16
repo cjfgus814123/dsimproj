@@ -6,8 +6,6 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /Path1
-        - /TF1
       Splitter Ratio: 0.43529412150382996
     Tree Height: 271
   - Class: rviz/Selection
@@ -126,7 +124,7 @@ Visualization Manager:
       Radius: 0.029999999329447746
       Shaft Diameter: 0.10000000149011612
       Shaft Length: 0.10000000149011612
-      Topic: /mission/planned_path
+      Topic: /rviz/drone_trajectory
       Unreliable: false
       Value: true
     - Alpha: 0.5
@@ -152,7 +150,7 @@ Visualization Manager:
       Marker Topic: /rviz/vfh_vector
       Name: Marker
       Namespaces:
-        {}
+        vfh_vector: true
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -184,28 +182,12 @@ Visualization Manager:
       Use rainbow: true
       Value: true
     - Class: rviz/TF
-      Enabled: true
+      Enabled: false
       Filter (blacklist): ""
       Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        base_link:
-          Value: true
-        base_link_frd:
-          Value: true
-        camera_link:
-          Value: true
-        map:
-          Value: true
-        map_ned:
-          Value: true
-        odom:
-          Value: true
-        odom_ned:
-          Value: true
-        rplidar_link:
-          Value: true
       Marker Alpha: 1
       Marker Scale: 1
       Name: TF
@@ -213,26 +195,46 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Tree:
-        map:
-          map_ned:
-            {}
-          odom:
-            base_link:
-              base_link_frd:
-                {}
-              camera_link:
-                {}
-              rplidar_link:
-                {}
-            odom_ned:
-              {}
+        {}
       Update Interval: 0
+      Value: false
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /rviz/vfh_vector
+      Name: Marker
+      Namespaces:
+        vfh_vector: true
+      Queue Size: 50
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 255; 0; 255
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Billboards
+      Line Width: 0.029999999329447746
+      Name: Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /rviz/global_path
+      Unreliable: false
       Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
     Default Light: true
-    Fixed Frame: rplidar_link
+    Fixed Frame: odom
     Frame Rate: 30
   Name: root
   Tools:
@@ -256,7 +258,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 4.208887100219727
+      Distance: 14.534456253051758
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -264,17 +266,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 0.5126326680183411
-        Y: -0.8351536989212036
-        Z: -0.18250222504138947
+        X: -0.43125542998313904
+        Y: -2.2584238052368164
+        Z: 7.934217929840088
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4297967553138733
+      Pitch: 0.6647964119911194
       Target Frame: base_link
-      Yaw: 4.873581409454346
+      Yaw: 3.3385872840881348
     Saved:
       - Class: rviz/Orbit
         Distance: 10

@@ -46,20 +46,14 @@ class PrecisionLander:
         self.land_alt = 0.3       
 
         # ==========================================
-        # [핵심] OpenCV Kalman Filter 초기화 (픽셀 필터링용)
-        # 상태 벡터 X = [x, y, v_x, v_y] (4차원)
-        # 측정 벡터 Z = [cx, cy] (2차원)
+        # [핵심] OpenCV Kalman Filter 초기화
         # ==========================================
         self.kf = cv2.KalmanFilter(4, 2)
-        
-        # 관측 행렬 (H): 측정값 Z가 상태 X의 어떤 부분인지 정의 [x, y 부분만 추출]
         self.kf.measurementMatrix = np.array([
             [1, 0, 0, 0],
             [0, 1, 0, 0]
         ], np.float32)
         
-        # 상태 전이 행렬 (A): 예측 모델 (등속도 모델, dt는 매 프레임 업데이트됨)
-        # 초기에는 dt = 0.033 (약 30Hz)으로 세팅
         self.kf.transitionMatrix = np.array([
             [1, 0, 0.033, 0],
             [0, 1, 0, 0.033],
@@ -67,17 +61,12 @@ class PrecisionLander:
             [0, 0, 0, 1]
         ], np.float32)
         
-        # 예측 노이즈 (Q): 물리 모델 불확실성 (값이 클수록 예측보다 센서를 믿음)
         self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        
-        # 측정 노이즈 (R): 카메라/YOLO 흔들림 (값이 클수록 센서를 덜 믿고 부드러워짐)
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
-        
-        # 오차 공분산 초기화 (P)
         self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
         
         self.last_time = rospy.Time.now()
-        self.kf_initialized = False # 칼만 필터가 첫 프레임을 받았는지 확인
+        self.kf_initialized = False 
 
         self.debug_pub = rospy.Publisher("/camera/image_debug", Image, queue_size=1)
 
@@ -86,9 +75,14 @@ class PrecisionLander:
         rospy.Subscriber("/mission/start_landing", Bool, self.start_landing_cb)
 
         self.vel_pub = rospy.Publisher("mavros/setpoint_velocity/cmd_vel_unstamped", Twist, queue_size=10)
+        
+        # ==========================================
+        # [추가] path_follower 에게 패드 발견 여부를 알리는 Publisher
+        # ==========================================
+        self.pad_detected_pub = rospy.Publisher("/vision/pad_detected", Bool, queue_size=1)
+
         rospy.wait_for_service("/mavros/set_mode")
         self.set_mode_client = rospy.ServiceProxy("/mavros/set_mode", SetMode)
-
         self.rate = rospy.Rate(20)
 
     def pose_cb(self, msg):
@@ -113,20 +107,14 @@ class PrecisionLander:
         self.landing_started = msg.data
 
     def image_cb(self, msg):
-        if not self.landing_started or self.is_landed:
-            self.last_time = rospy.Time.now()
+        # 이미 착륙 완료 상태면 CPU 절약을 위해 종료
+        if self.is_landed:
             return
 
         try:
-            current_time = rospy.Time.now()
-            dt = (current_time - self.last_time).to_sec()
-            if dt <= 0: dt = 0.033
-            self.last_time = current_time
-
-            # 칼만 필터의 A(상태전이행렬)에 현재 dt 반영
-            self.kf.transitionMatrix[0, 2] = dt
-            self.kf.transitionMatrix[1, 3] = dt
-
+            # ----------------------------------------------------
+            # 1. 감시 모드 (착륙 명령 전에도 항상 바닥을 분석하여 패드를 찾습니다)
+            # ----------------------------------------------------
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             height, width, _ = cv_image.shape
             self.image_center_x = width // 2
@@ -157,50 +145,65 @@ class PrecisionLander:
                         target_found = True
                         cv2.drawContours(cv_image, [largest_contour], -1, (0, 255, 255), 2)
 
+            # [핵심] 패드를 찾았는지 여부를 path_follower에게 매 프레임 알려줍니다!
+            detect_msg = Bool()
+            detect_msg.data = target_found
+            self.pad_detected_pub.publish(detect_msg)
+
+            # [추가] 착륙 명령을 받기 전이라면 제어 명령은 쏘지 않고 화상 디버깅만 퍼블리시
+            if not self.landing_started:
+                self.last_time = rospy.Time.now()
+                if target_found:
+                    cv2.putText(cv_image, "PAD SPOTTED! WAITING HANDOVER...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                else:
+                    cv2.putText(cv_image, "SEARCHING PAD...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                
+                debug_msg = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
+                self.debug_pub.publish(debug_msg)
+                return
+
+            # ----------------------------------------------------
+            # 2. 제어 모드 (착륙 명령이 떨어진 이후 실행되는 기존 로직)
+            # ----------------------------------------------------
+            current_time = rospy.Time.now()
+            dt = (current_time - self.last_time).to_sec()
+            if dt <= 0: dt = 0.033
+            self.last_time = current_time
+
+            self.kf.transitionMatrix[0, 2] = dt
+            self.kf.transitionMatrix[1, 3] = dt
+
             cmd_vel = Twist()
             current_z = max(0.1, self.current_pose.pose.position.z)
             
-            # ==========================================
-            # OpenCV Kalman Filter: 예측 및 업데이트 (픽셀 기준)
-            # ==========================================
-            # 항상 미래 위치를 먼저 예측 (Prediction)
             predicted = self.kf.predict()
             kf_cx, kf_cy = predicted[0][0], predicted[1][0]
 
             if target_found:
-                # 첫 발견 시, 필터가 엉뚱한 곳에서 시작하지 않도록 위치 강제 초기화
                 if not self.kf_initialized:
                     self.kf.statePost = np.array([[raw_cx], [raw_cy], [0], [0]], np.float32)
                     kf_cx, kf_cy = raw_cx, raw_cy
                     self.kf_initialized = True
                 else:
-                    # 측정이 들어오면 Z 행렬을 만들어 Update
                     measurement = np.array([[np.float32(raw_cx)], [np.float32(raw_cy)]])
                     estimated = self.kf.correct(measurement)
                     kf_cx, kf_cy = estimated[0][0], estimated[1][0]
             else:
-                # 타겟을 놓친 경우, update 없이 predict된 값(관성)을 그대로 믿음
                 pass
 
-            # ==========================================
-            # 보정된 픽셀 좌표(kf_cx, kf_cy)로 물리 오차 제어
-            # ==========================================
             if self.kf_initialized:
                 error_x_pixel = kf_cx - self.image_center_x
                 error_y_pixel = kf_cy - self.image_center_y
 
-                # 핀홀 모델 (보정된 픽셀 -> 물리적 미터)
                 raw_x_meter = (error_x_pixel * current_z) / self.focal_length_x
                 raw_y_meter = (error_y_pixel * current_z) / self.focal_length_y
 
-                # IMU 자세 보상 (가짜 오차 제거)
                 comp_x = current_z * math.tan(self.pitch)
                 comp_y = current_z * math.tan(self.roll)
 
                 true_x_meter = raw_x_meter - comp_x
                 true_y_meter = raw_y_meter - comp_y
 
-                # PID 제어부
                 self.error_sum_x = np.clip(self.error_sum_x + true_x_meter, -1.0, 1.0)
                 self.error_sum_y = np.clip(self.error_sum_y + true_y_meter, -1.0, 1.0)
 
@@ -214,14 +217,12 @@ class PrecisionLander:
                 pid_x = (self.kp_metric * true_x_meter) + (self.ki_metric * self.error_sum_x) + (self.kd_metric * diff_error_x)
                 pid_y = (self.kp_metric * true_y_meter) + (self.ki_metric * self.error_sum_y) + (self.kd_metric * diff_error_y)
 
-                # 90도 회전 카메라 매핑
                 cmd_vel.linear.x = float(np.clip(pid_x, -1.0, 1.0))
                 cmd_vel.linear.y = float(np.clip(-pid_y, -1.0, 1.0))
 
                 self.prev_error_x = true_x_meter
                 self.prev_error_y = true_y_meter
 
-                # 하강 판정
                 if abs(error_x_pixel) < 80 and abs(error_y_pixel) < 80:
                     cmd_vel.linear.z = self.descend_speed
                 else:
@@ -236,12 +237,11 @@ class PrecisionLander:
                 self.error_sum_x, self.error_sum_y = 0.0, 0.0
                 self.prev_error_x, self.error_y_meter = 0.0, 0.0
 
-            # HUD 드로잉: 원본 YOLO(빨강) vs KF 추정치(초록) 비교
             cv2.drawMarker(cv_image, (self.image_center_x, self.image_center_y), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
             if target_found:
-                cv2.circle(cv_image, (raw_cx, raw_cy), 5, (0, 0, 255), -1) # Raw: 빨간 점
+                cv2.circle(cv_image, (raw_cx, raw_cy), 5, (0, 0, 255), -1) 
             if self.kf_initialized:
-                cv2.circle(cv_image, (int(kf_cx), int(kf_cy)), 8, (0, 255, 0), 2) # KF: 초록색 큰 원
+                cv2.circle(cv_image, (int(kf_cx), int(kf_cy)), 8, (0, 255, 0), 2) 
                 cv2.line(cv_image, (self.image_center_x, self.image_center_y), (int(kf_cx), int(kf_cy)), (255, 0, 0), 2)
 
             cv2.putText(cv_image, f"1. Alt(Z)   : {current_z:.2f} m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -252,11 +252,9 @@ class PrecisionLander:
                 cv2.putText(cv_image, "PAD LOST - KF TRACKING...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
             if current_z < self.land_alt:
-                # 완벽하게 중심(오차 15픽셀 이내)에 들어왔는지 확인
                 if abs(error_x_pixel) < 15 and abs(error_y_pixel) < 15:
                     self.trigger_auto_land()
                 else:
-                    # 아직 중심에 못 왔다면, 더 이상 하강하지 말고 그 고도에서 호버링하며 중심을 맞춤!
                     cmd_vel.linear.z = 0.0 
                     cv2.putText(cv_image, "ALIGNING FOR LAND...", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
