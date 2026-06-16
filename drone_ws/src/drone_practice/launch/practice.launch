@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
 <launch>
+  <master auto="start"/>
    
   <arg name="x" default="0"/>
   <arg name="y" default="0"/>

@@ -46,7 +46,7 @@ class PrecisionLander:
         self.land_alt = 0.3       
 
         # ==========================================
-        # [핵심] OpenCV Kalman Filter 초기화
+        # OpenCV Kalman Filter 초기화
         # ==========================================
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix = np.array([
@@ -76,9 +76,7 @@ class PrecisionLander:
 
         self.vel_pub = rospy.Publisher("mavros/setpoint_velocity/cmd_vel_unstamped", Twist, queue_size=10)
         
-        # ==========================================
-        # [추가] path_follower 에게 패드 발견 여부를 알리는 Publisher
-        # ==========================================
+        # path_follower 에게 패드 발견 여부를 쏘는 Publisher
         self.pad_detected_pub = rospy.Publisher("/vision/pad_detected", Bool, queue_size=1)
 
         rospy.wait_for_service("/mavros/set_mode")
@@ -107,14 +105,11 @@ class PrecisionLander:
         self.landing_started = msg.data
 
     def image_cb(self, msg):
-        # 이미 착륙 완료 상태면 CPU 절약을 위해 종료
         if self.is_landed:
             return
 
         try:
-            # ----------------------------------------------------
-            # 1. 감시 모드 (착륙 명령 전에도 항상 바닥을 분석하여 패드를 찾습니다)
-            # ----------------------------------------------------
+            # 1. 감시 모드 (착륙 전에도 항상 패드 탐색)
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             height, width, _ = cv_image.shape
             self.image_center_x = width // 2
@@ -145,12 +140,12 @@ class PrecisionLander:
                         target_found = True
                         cv2.drawContours(cv_image, [largest_contour], -1, (0, 255, 255), 2)
 
-            # [핵심] 패드를 찾았는지 여부를 path_follower에게 매 프레임 알려줍니다!
+            # 패드 발견 여부 실시간 전송
             detect_msg = Bool()
             detect_msg.data = target_found
             self.pad_detected_pub.publish(detect_msg)
 
-            # [추가] 착륙 명령을 받기 전이라면 제어 명령은 쏘지 않고 화상 디버깅만 퍼블리시
+            # 착륙 명령 전이면 제어 로직 패스
             if not self.landing_started:
                 self.last_time = rospy.Time.now()
                 if target_found:
@@ -162,9 +157,7 @@ class PrecisionLander:
                 self.debug_pub.publish(debug_msg)
                 return
 
-            # ----------------------------------------------------
-            # 2. 제어 모드 (착륙 명령이 떨어진 이후 실행되는 기존 로직)
-            # ----------------------------------------------------
+            # 2. 착륙 제어 모드
             current_time = rospy.Time.now()
             dt = (current_time - self.last_time).to_sec()
             if dt <= 0: dt = 0.033
@@ -223,19 +216,25 @@ class PrecisionLander:
                 self.prev_error_x = true_x_meter
                 self.prev_error_y = true_y_meter
 
-                if abs(error_x_pixel) < 80 and abs(error_y_pixel) < 80:
-                    cmd_vel.linear.z = self.descend_speed
+                # [동적 하강 로직] 정렬 상태에 따라 하강 속도 결정
+                pixel_error_dist = math.sqrt(error_x_pixel**2 + error_y_pixel**2)
+
+                if pixel_error_dist > 60:
+                    cmd_vel.linear.z = 0.0 # 하강 정지, 수평 정렬 집중
+                elif pixel_error_dist > 20:
+                    cmd_vel.linear.z = -0.05 # 미세 정렬하며 천천히 하강
                 else:
-                    cmd_vel.linear.z = -0.05 
+                    cmd_vel.linear.z = self.descend_speed # 정중앙일 때 빠른 하강
                     
-                rospy.loginfo_throttle(0.5, f"Raw Pix:({raw_cx},{raw_cy}) | KF Pix:({int(kf_cx)},{int(kf_cy)}) | Vel:({cmd_vel.linear.x:.2f},{cmd_vel.linear.y:.2f})")
+                rospy.loginfo_throttle(0.5, f"Raw Pix:({raw_cx},{raw_cy}) | Error Dist:{pixel_error_dist:.1f}px | Z Vel:{cmd_vel.linear.z:.2f}")
 
             else:
+                # [안전 로직] 패드를 잃어버리면 절대 하강 금지, 제자리 호버링하며 탐색
                 cmd_vel.linear.x = 0.0
                 cmd_vel.linear.y = 0.0
-                cmd_vel.linear.z = -0.02 
+                cmd_vel.linear.z = 0.0  
                 self.error_sum_x, self.error_sum_y = 0.0, 0.0
-                self.prev_error_x, self.error_y_meter = 0.0, 0.0
+                self.prev_error_x, self.prev_error_y = 0.0, 0.0 
 
             cv2.drawMarker(cv_image, (self.image_center_x, self.image_center_y), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
             if target_found:
@@ -249,7 +248,7 @@ class PrecisionLander:
             cv2.putText(cv_image, f"3. Cmd Vel  : ({cmd_vel.linear.x:.2f}, {cmd_vel.linear.y:.2f}) m/s", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             if not target_found and self.kf_initialized:
-                cv2.putText(cv_image, "PAD LOST - KF TRACKING...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+                cv2.putText(cv_image, "PAD LOST - HOVERING & SEARCHING...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
             if current_z < self.land_alt:
                 if abs(error_x_pixel) < 15 and abs(error_y_pixel) < 15:

@@ -214,7 +214,5 @@ catkin_install_python(PROGRAMS
   scripts/mission_controller.py
   scripts/path_follower.py
   scripts/precision_lander.py
-  scripts/vfh.py
-  scripts/avoid.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

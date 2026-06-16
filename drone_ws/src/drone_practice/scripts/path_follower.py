@@ -82,7 +82,9 @@ class PathFollower:
         self.mission_started = msg.data
 
     def pad_detect_cb(self, msg):
-        self.pad_detected = msg.data
+        # [결함 1 해결] 한 번이라도 True가 들어오면 영구적으로 True 상태를 잠금(Lock)
+        if msg.data:
+            self.pad_detected = True
 
     def lidar_cb(self, msg):
         self.latest_scan = msg.ranges
@@ -90,6 +92,12 @@ class PathFollower:
         self.scan_angle_inc = msg.angle_increment
 
     def depth_cb(self, msg):
+        if not hasattr(self, 'last_depth_time'): 
+            self.last_depth_time = rospy.Time.now()
+        if (rospy.Time.now() - self.last_depth_time).to_sec() < 0.1: 
+            return 
+        self.last_depth_time = rospy.Time.now()
+
         try:
             cv_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
             cv_depth = np.nan_to_num(cv_depth, nan=10.0, posinf=10.0, neginf=0.0)
@@ -146,7 +154,7 @@ class PathFollower:
         wp_current = self.waypoints[self.closest_idx]
         wp_next = self.waypoints[self.closest_idx + 1]
 
-        strict_arrive_dist = 0.5 
+        strict_arrive_dist = 0.1 
         dist_to_next = self.calc_distance(cx, cy, wp_next[0], wp_next[1])
         if dist_to_next < strict_arrive_dist:
             self.closest_idx += 1
@@ -166,7 +174,7 @@ class PathFollower:
             cross_product = abs(vec_path_x * vec_drone_y - vec_path_y * vec_drone_x)
             lateral_error = cross_product / path_length
             
-            gate_width = 1.2 
+            gate_width = 0.9 
             
             if dot_product > path_length_sq and lateral_error < gate_width:
                 self.closest_idx += 1
@@ -193,13 +201,12 @@ class PathFollower:
         
         v_min = 0.5 
         speed = max(self.max_speed, v_min) 
+        
+        self.stanley_k = 1.0
         correction = math.atan2(self.stanley_k * lateral_error, speed)
 
         return path_angle + correction
 
-    # ==========================================
-    # [핵심 수정] 완벽한 90도 직각 게걸음 및 넉넉한 락(Lock) 해제
-    # ==========================================
     def get_hybrid_target_angle(self, original_target_angle_local):
         if self.depth_array is None:
             return original_target_angle_local
@@ -212,7 +219,6 @@ class PathFollower:
         center_region = self.depth_array[int(num_pixels*0.3) : int(num_pixels*0.7)]
         min_front = np.min(center_region) if len(center_region) > 0 else 10.0
         
-        # [수정] 대각선이 아니라 완벽한 90도(직각)로 설정하여 옆으로만 밀고 나가게 만듦!
         detour_angle = math.pi / 2.0 
         
         if min_front < safe_dist:
@@ -227,10 +233,10 @@ class PathFollower:
                 
                 if avg_left > avg_right:
                     self.wall_avoid_direction = 1
-                    rospy.loginfo("🧱 [Depth] 거대 벽 감지: [왼쪽]으로 완벽한 게걸음 락(Lock)!")
+                    rospy.loginfo("🧱 [Depth] 45도 벽 감지: [왼쪽]으로 게걸음 Lock!")
                 else:
                     self.wall_avoid_direction = -1
-                    rospy.loginfo("🧱 [Depth] 거대 벽 감지: [오른쪽]으로 완벽한 게걸음 락(Lock)!")
+                    rospy.loginfo("🧱 [Depth] 45도 벽 감지: [오른쪽]으로 게걸음 Lock!")
                     
             if self.wall_avoid_direction == 1:
                 return detour_angle
@@ -241,10 +247,9 @@ class PathFollower:
             if self.wall_avoid_direction != 0:
                 self.wall_clear_count += 1
                 
-                # [수정] 20프레임(1초) 동안 뚫린 것을 확인한 후에야 락을 풀어 확실하게 벽을 벗어남
                 if self.wall_clear_count > 30:
                     self.wall_avoid_direction = 0
-                    rospy.loginfo("✅ [Depth] 거대 벽 완벽 탈출 완료. 정상 경로로 복귀합니다.")
+                    rospy.loginfo("✅ [Depth] 벽 완벽 탈출 완료. 정상 경로로 복귀합니다.")
                 else:
                     return detour_angle if self.wall_avoid_direction == 1 else -detour_angle
                     
@@ -253,40 +258,45 @@ class PathFollower:
     def compute_vfh_velocity(self, target_angle_local):
         if self.latest_scan is None:
             return self.max_speed * math.cos(target_angle_local), self.max_speed * math.sin(target_angle_local)
-        # 1. 벽 추종용 로직 추가
-        # 라이다 데이터 중 왼쪽/오른쪽 벽과의 거리 확인
-        left_side = np.array(self.latest_scan[0:20]) # 라이다의 왼쪽 90도 범위
-        right_side = np.array(self.latest_scan[52:72]) # 라이다의 오른쪽 90도 범위
-        
-        # [핵심] 벽과의 목표 거리 (0.6m)
-        target_wall_dist = 0.6 
-        
-        # 벽을 타고 가야 하는 상황인지 판단 (전방 1.5m 이내에 벽이 있는 경우)
-        front_dist = np.min(self.latest_scan[30:42])
-        
-        # 벽 추종 제어 명령
-        wall_vx, wall_vy = 0.0, 0.0
-        
-        if front_dist < 1.5:
-            # 왼쪽 벽이 더 가깝다면 오른쪽으로 살짝 밀어주며 전진
-            if np.min(left_side) < np.min(right_side):
-                wall_vy = -0.5 # 오른쪽으로 게걸음
-                wall_vx = 0.3  # 느리게 전진
-            else:
-                wall_vy = 0.5  # 왼쪽으로 게걸음
-                wall_vx = 0.3
-            return wall_vx, wall_vy
+
+        # [결함 2 해결] 라이다 정면(Front) 거리 정확하게 계산하기 (배열 인덱스가 아닌 각도 기반)
+        front_distances = []
+        for i, dist in enumerate(self.latest_scan):
+            angle = self.scan_angle_min + i * self.scan_angle_inc
+            angle = (angle + math.pi) % (2 * math.pi) - math.pi # -pi ~ pi 로 정규화
+            
+            # 정면 기준 +/- 20도 이내의 유효한 라이다 값만 추출
+            if abs(angle) < math.radians(20):
+                if 0.1 < dist < 10.0 and not math.isinf(dist) and not math.isnan(dist):
+                    front_distances.append(dist)
+                    
+        front_dist = min(front_distances) if front_distances else 10.0
+
+        if self.wall_avoid_direction != 0:
+            strafe_speed = 1.0 * self.wall_avoid_direction # 락(Lock)이 걸렸으므로 옆으로만 확고하게 이동
+            forward_speed = 0.2
+            
+            # 45도 벽이라 코앞(1.5m 이내)까지 다가오면 즉시 브레이크를 밟고 후진하며 게걸음
+            if front_dist < 1.5:
+                forward_speed = -0.3 
+                
+            return forward_speed, strafe_speed
             
         num_bins = 72  
         bin_size = 2.0 * math.pi / num_bins
         histogram = [0.0] * num_bins
         
-        # [수정] 옆으로 미끄러질 때 VFH가 과민반응하지 않도록 안전 반경을 살짝 축소
-        safe_dist = 2.0        
+        safe_dist = 3.0        
         drone_radius = 0.4    
 
-        for i, dist in enumerate(self.latest_scan):
-            if 0.3 < dist < safe_dist and not math.isinf(dist) and not math.isnan(dist):
+        # [결함 4 해결] VFH 연산 최적화 (데이터를 72개로 대폭 압축하여 CPU 부하 및 Time Jump 원천 차단)
+        step = len(self.latest_scan) // 72
+        if step < 1: step = 1
+
+        for i in range(0, len(self.latest_scan), step):
+            dist = self.latest_scan[i]
+            # [결함 3 해결] 벽 코앞에서 투명해지는 현상 수정 (0.3 -> 0.1)
+            if 0.1 < dist < safe_dist and not math.isinf(dist) and not math.isnan(dist):
                 angle = self.scan_angle_min + i * self.scan_angle_inc
                 mag = (safe_dist - dist) ** 2  
                 enlargement = math.asin(min(drone_radius / dist, 1.0))
@@ -370,7 +380,11 @@ class PathFollower:
 
     def run(self):
         while not rospy.is_shutdown():
+            # [결함 1 연계 해결] 랜딩 모드로 넘어가면 지속적으로 착륙 신호를 퍼블리시하여 통신 유실 방지
             if self.is_landing:
+                land_msg = Bool()
+                land_msg.data = True
+                self.start_landing_pub.publish(land_msg)
                 self.rate.sleep()
                 continue
 
@@ -390,22 +404,14 @@ class PathFollower:
             if is_final_leg and dist_to_final < 5.0:
                 current_max_speed = max(0.5, self.max_speed * (dist_to_final / 5.0))
             
-            if is_final_leg and self.pad_detected:
-                rospy.loginfo("🎯 [Vision] 랜딩 패드 포착! 제어권을 조기 인계합니다.")
-                land_msg = Bool()
-                land_msg.data = True
-                self.start_landing_pub.publish(land_msg)
+            if self.pad_detected:
+                rospy.loginfo("🎯 [Vision] 랜딩 패드 1회 이상 포착! 제어권을 즉시 인계합니다.")
                 self.is_landing = True
-                rospy.sleep(1.0)
                 continue
 
             if is_final_leg and dist_to_final < self.arrive_dist:
                 rospy.loginfo("Path following complete! Starting Precision Landing.")
-                land_msg = Bool()
-                land_msg.data = True
-                self.start_landing_pub.publish(land_msg)
                 self.is_landing = True
-                rospy.sleep(1.0)
                 continue
 
             lookahead_time = 0.3  
@@ -427,7 +433,6 @@ class PathFollower:
             cmd_vel.linear.x = float(np.clip(self.filtered_vx, -current_max_speed, current_max_speed))
             cmd_vel.linear.y = float(np.clip(self.filtered_vy, -current_max_speed, current_max_speed))
             
-            # [유지] 게걸음 비행 (기수 회전 금지)
             cmd_vel.angular.z = 0.0 
             
             alt_error = self.target_alt - cz
