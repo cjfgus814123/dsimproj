@@ -1,11 +1,11 @@
 Autonomous UAV Navigation & Precision Landing System
 ---
 프로젝트 개요 (Project Overview)
-
+---
 이 프로젝트는 PX4 Autopilot 및 ROS 기반의 무인기(UAV)가 복잡한 환경에서 자율 주행(Waypoint Navigation), 다중 센서 융합 기반 장애물 회피(Hybrid Obstacle Avoidance), 그리고 비전 기반 정밀 착륙(Vision-based Precision Landing)을 수행하도록 설계된 통합 제어 프레임워크입니다.
 
 주요 기능 및 알고리즘 (Key Features)
-
+---
  1. 하이브리드 장애물 회피 (Hybrid Obstacle Avoidance)
 
 Depth Camera (전역적 판단): 45도 형태의 거대 벽면을 인식하고 '우회 방향 잠금(Hysteresis Lock)'을 수행하여 연산 폭주(Time Jump) 및 갈팡질팡하는 진동 현상을 원천 차단합니다.
@@ -25,7 +25,7 @@ RPLiDAR + VFH (지역적 회피): 72방향으로 압축된 Vector Field Histogra
 ---
 
 시스템 아키텍처 및 노드 설명 (System Nodes)
-
+---
 본 패키지는 세 가지 주요 ROS 노드로 유기적으로 작동합니다.
 
 1. `mission_controller.py` (비행 준비 및 제어 총괄)
@@ -56,7 +56,7 @@ RPLiDAR + VFH (지역적 회피): 72방향으로 압축된 Vector Field Histogra
 ---
 
 실행 방법 (How to Run)
-
+---
 1. 사전 요구 사항 (Prerequisites)
 
 * Ubuntu 20.04 & ROS Noetic
