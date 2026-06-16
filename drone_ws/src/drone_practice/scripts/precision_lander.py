@@ -232,7 +232,7 @@ class PrecisionLander:
             else:
                 cmd_vel.linear.x = 0.0
                 cmd_vel.linear.y = 0.0
-                cmd_vel.linear.z = -0.05 
+                cmd_vel.linear.z = -0.02 
                 self.error_sum_x, self.error_sum_y = 0.0, 0.0
                 self.prev_error_x, self.error_y_meter = 0.0, 0.0
 

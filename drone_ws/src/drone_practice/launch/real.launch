@@ -26,9 +26,19 @@
     <arg name="sdf"     value="$(arg sdf)"/>
   </include>
   
+  <node pkg="tf" type="static_transform_publisher" name="tf_rplidar" 
+        args="0 0 0.1 0 0 0 base_link rplidar_link 10" />
+
+  <node pkg="tf" type="static_transform_publisher" name="tf_depth_camera" 
+        args="0.1 0 0 -1.57 0 -1.57 base_link camera_link 10" />
+        
+  <node pkg="tf" type="static_transform_publisher" name="map_to_odom" 
+      args="0 0 0 0 0 0 map odom 100" />
+
+        
   <node pkg="drone_practice" type="mission_controller.py" name="mission_controller" output="screen" />
   
-  <node pkg="drone_practice" type="vfh.py" name="path_follower" output="screen">
+  <node pkg="drone_practice" type="path_follower.py" name="path_follower" output="screen">
       <param name="csv_path" value="$(arg csv_file)" />
   </node>
   
