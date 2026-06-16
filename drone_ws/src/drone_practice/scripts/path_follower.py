@@ -98,7 +98,7 @@ class PathFollower:
         dist_to_target = self.calc_distance(cx, cy, target_x, target_y)
 
         # 타겟 반경 1.5m 이내에 진입해야만 다음 웨이포인트로 넘어감
-        if dist_to_target < 1.5:
+        if dist_to_target < 1.0:
             self.closest_idx += 1
             rospy.loginfo(f"✅ WP {self.closest_idx} 통과! 다음 경로로 이동합니다.")
 
