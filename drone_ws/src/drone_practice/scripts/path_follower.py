@@ -57,7 +57,9 @@ class PathFollower:
         rospy.Subscriber("mavros/local_position/pose", PoseStamped, self.pose_cb)
         rospy.Subscriber("/mission/start_flag", Bool, self.start_cb)
         rospy.Subscriber("/laser/scan", LaserScan, self.lidar_cb)
-        rospy.Subscriber("/camera/depth/image_raw", Image, self.depth_cb)
+        
+        # [수정 완료] 토픽 이름 정확히 매칭
+        rospy.Subscriber("/iris/camera/depth/image_raw", Image, self.depth_cb)
         rospy.Subscriber("/vision/pad_detected", Bool, self.pad_detect_cb)
 
         self.vel_pub = rospy.Publisher("mavros/setpoint_velocity/cmd_vel_unstamped", Twist, queue_size=10)
@@ -82,7 +84,6 @@ class PathFollower:
         self.mission_started = msg.data
 
     def pad_detect_cb(self, msg):
-        # [결함 1 해결] 한 번이라도 True가 들어오면 영구적으로 True 상태를 잠금(Lock)
         if msg.data:
             self.pad_detected = True
 
@@ -202,7 +203,7 @@ class PathFollower:
         v_min = 0.5 
         speed = max(self.max_speed, v_min) 
         
-        self.stanley_k = 1.0
+        self.stanley_k = 1.2
         correction = math.atan2(self.stanley_k * lateral_error, speed)
 
         return path_angle + correction
@@ -211,7 +212,7 @@ class PathFollower:
         if self.depth_array is None:
             return original_target_angle_local
             
-        safe_dist = 4.0 
+        safe_dist = 1.0 
         num_pixels = len(self.depth_array)
         if num_pixels == 0: 
             return original_target_angle_local
@@ -225,18 +226,20 @@ class PathFollower:
             self.wall_clear_count = 0  
             
             if self.wall_avoid_direction == 0:
-                left_region = self.depth_array[0 : int(num_pixels*0.3)]
-                right_region = self.depth_array[int(num_pixels*0.7) : num_pixels]
+                # 좌/우 비교 시 조금 더 넓은 범위를 보도록 수정
+                left_region = self.depth_array[0 : int(num_pixels*0.4)]
+                right_region = self.depth_array[int(num_pixels*0.6) : num_pixels]
                 
                 avg_left = np.mean(left_region) if len(left_region) > 0 else 10.0
                 avg_right = np.mean(right_region) if len(right_region) > 0 else 10.0
                 
+                # 깊이값이 크다 = 막힌 것 없이 뻥 뚫려있다
                 if avg_left > avg_right:
                     self.wall_avoid_direction = 1
-                    rospy.loginfo("🧱 [Depth] 45도 벽 감지: [왼쪽]으로 게걸음 Lock!")
+                    rospy.loginfo("🧱 [Depth] 거대 벽 감지: [왼쪽]으로 부드러운 벽타기 시작!")
                 else:
                     self.wall_avoid_direction = -1
-                    rospy.loginfo("🧱 [Depth] 45도 벽 감지: [오른쪽]으로 게걸음 Lock!")
+                    rospy.loginfo("🧱 [Depth] 거대 벽 감지: [오른쪽]으로 부드러운 벽타기 시작!")
                     
             if self.wall_avoid_direction == 1:
                 return detour_angle
@@ -247,7 +250,8 @@ class PathFollower:
             if self.wall_avoid_direction != 0:
                 self.wall_clear_count += 1
                 
-                if self.wall_clear_count > 30:
+                # [수정 1] 카메라 밖으로 벽이 나가더라도, 옆구리에 남은 벽을 완전히 지나치기 위해 3초간(45프레임) 락(Lock)을 끈적하게 유지!
+                if self.wall_clear_count > 15:
                     self.wall_avoid_direction = 0
                     rospy.loginfo("✅ [Depth] 벽 완벽 탈출 완료. 정상 경로로 복귀합니다.")
                 else:
@@ -259,43 +263,45 @@ class PathFollower:
         if self.latest_scan is None:
             return self.max_speed * math.cos(target_angle_local), self.max_speed * math.sin(target_angle_local)
 
-        # [결함 2 해결] 라이다 정면(Front) 거리 정확하게 계산하기 (배열 인덱스가 아닌 각도 기반)
         front_distances = []
         for i, dist in enumerate(self.latest_scan):
             angle = self.scan_angle_min + i * self.scan_angle_inc
-            angle = (angle + math.pi) % (2 * math.pi) - math.pi # -pi ~ pi 로 정규화
+            angle = (angle + math.pi) % (2 * math.pi) - math.pi 
             
-            # 정면 기준 +/- 20도 이내의 유효한 라이다 값만 추출
-            if abs(angle) < math.radians(20):
+            if abs(angle) < math.radians(30):
                 if 0.1 < dist < 10.0 and not math.isinf(dist) and not math.isnan(dist):
                     front_distances.append(dist)
                     
         front_dist = min(front_distances) if front_distances else 10.0
 
+        # ==========================================
+        # [핵심 수정 2] 대각선 슬라이딩 벽타기 (기본 전진 속도 부여)
+        # ==========================================
         if self.wall_avoid_direction != 0:
-            strafe_speed = 1.0 * self.wall_avoid_direction # 락(Lock)이 걸렸으므로 옆으로만 확고하게 이동
-            forward_speed = 0.2
+            strafe_speed = 0.5 * self.wall_avoid_direction # 게걸음 속도
             
-            # 45도 벽이라 코앞(1.5m 이내)까지 다가오면 즉시 브레이크를 밟고 후진하며 게걸음
-            if front_dist < 1.5:
-                forward_speed = -0.3 
+            # 벽과의 간격을 항상 1.0m로 유지하기 위한 오차 계산
+            error_dist = front_dist - 1.0
+            	
+            # [수정] 기본 전진 속도 0.6을 더해줌! 
+            # 45도 벽에서는 앞으로 나아가며 미끄러지고, 직각 벽에 막히면 스스로 전진을 멈춤
+            forward_speed = 0.6 + float(np.clip(error_dist * 0.8, -0.6, 0.6))
                 
             return forward_speed, strafe_speed
+            
             
         num_bins = 72  
         bin_size = 2.0 * math.pi / num_bins
         histogram = [0.0] * num_bins
         
-        safe_dist = 3.0        
+        safe_dist = 2.0        
         drone_radius = 0.4    
 
-        # [결함 4 해결] VFH 연산 최적화 (데이터를 72개로 대폭 압축하여 CPU 부하 및 Time Jump 원천 차단)
         step = len(self.latest_scan) // 72
         if step < 1: step = 1
 
         for i in range(0, len(self.latest_scan), step):
             dist = self.latest_scan[i]
-            # [결함 3 해결] 벽 코앞에서 투명해지는 현상 수정 (0.3 -> 0.1)
             if 0.1 < dist < safe_dist and not math.isinf(dist) and not math.isnan(dist):
                 angle = self.scan_angle_min + i * self.scan_angle_inc
                 mag = (safe_dist - dist) ** 2  
@@ -380,7 +386,6 @@ class PathFollower:
 
     def run(self):
         while not rospy.is_shutdown():
-            # [결함 1 연계 해결] 랜딩 모드로 넘어가면 지속적으로 착륙 신호를 퍼블리시하여 통신 유실 방지
             if self.is_landing:
                 land_msg = Bool()
                 land_msg.data = True
