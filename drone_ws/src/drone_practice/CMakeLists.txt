@@ -210,7 +210,6 @@ include_directories(
 ## Custom: Install Scripts ##
 #############################
 catkin_install_python(PROGRAMS
-  scripts/drone_demo.py
   scripts/mission_controller.py
   scripts/path_follower.py
   scripts/precision_lander.py
