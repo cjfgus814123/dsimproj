@@ -73,8 +73,3 @@ roslaunch drone_practice real.launch
 * **TF 변환:** `base_link` $\rightarrow$ `rplidar_link`, `camera_link` 변환 및 `map` $\rightarrow$ `odom` 변환이 백그라운드에서 자동 퍼블리시됩니다.
 * **시각화:** RViz 윈도우가 열리며 궤적, VFH 벡터, 로컬 카메라 디버깅 화면(`landing.rviz`)을 실시간으로 확인할 수 있습니다.
 
-
-
----
-
-💡 **Tip:** "주요 기능 및 핵심 알고리즘" 파트에 추가된 2번(가상 게이트)과 1번의 상세 내용(P-제어)이 이 프로젝트가 단순한 오픈소스 짜깁기가 아니라 **직접 물리적/수학적 고민을 거쳐 완성한 결과물**임을 강력하게 증명해 줄 것입니다!
