@@ -63,6 +63,13 @@
 작성된 통합 런치 파일을 통해 `roscore`, Gazebo 시뮬레이터(`practice.world`), MAVROS, TF 변환, 그리고 3개의 제어 노드와 RViz가 한 번에 실행됩니다. `<master auto="start"/>` 태그가 포함되어 있어 ROS 마스터가 자동으로 실행 및 보장됩니다.
 
 ```bash
+#워크스페이스 빌드
+cd ~/catkin_ws
+source /opt/ros/noetic/setup.bash
+catkin_make
+#환경소싱
+source devel/setup.bash
+source src/drone_ws/drone_ws/src/drone_practice/launch/setup_px4_env.sh
 # 워크스페이스 빌드 및 환경 소싱 후 실행
 roslaunch drone_practice real.launch
 
